@@ -40,6 +40,7 @@ import org.apache.kafka.storage.internals.log.{LogManager => JLogManager}
 
 import java.util.concurrent.CompletableFuture
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 
 object BrokerMetadataPublisher extends Logging {
@@ -87,6 +88,16 @@ class BrokerMetadataPublisher(
 
   import BrokerMetadataPublisher._
 
+  private val injectedDeleteDelayMs = sys.env
+    .get("KAFKA_BROKER_METADATA_DELETE_DELAY_MS")
+    .flatMap(value => Try(value.toLong).toOption)
+    .filter(_ > 0)
+    .getOrElse(0L)
+  private val injectedDeleteDelayTopic = sys.env
+    .get("KAFKA_BROKER_METADATA_DELETE_DELAY_TOPIC")
+    .map(_.trim)
+    .filter(_.nonEmpty)
+
   /**
    * The broker ID.
    */
@@ -125,6 +136,8 @@ class BrokerMetadataPublisher(
       if (isTraceEnabled) {
         trace(s"Publishing delta $delta with highest offset $highestOffsetAndEpoch")
       }
+
+      maybeInjectDeleteDelay(delta)
 
       // Publish the new metadata image to the metadata cache.
       metadataCache.setImage(newImage)
@@ -247,6 +260,28 @@ class BrokerMetadataPublisher(
     } finally {
       _firstPublish = false
       firstPublishFuture.complete(null)
+    }
+  }
+
+  private def maybeInjectDeleteDelay(delta: MetadataDelta): Unit = {
+    if (injectedDeleteDelayMs <= 0) {
+      return
+    }
+
+    val deletedTopicNames = Option(delta.topicsDelta()).toSeq.flatMap { topicsDelta =>
+      topicsDelta.deletedTopicIds().asScala.flatMap { topicId =>
+        Option(metadataCache.getImage.topics().getTopic(topicId)).map(_.name())
+      }
+    }.toSet
+
+    val shouldDelay = injectedDeleteDelayTopic match {
+      case Some(topicName) => deletedTopicNames.contains(topicName)
+      case None => deletedTopicNames.nonEmpty
+    }
+
+    if (shouldDelay) {
+      info(s"Injecting ${injectedDeleteDelayMs}ms broker metadata delay before applying delete update for topic(s) ${deletedTopicNames.mkString(",")}")
+      Thread.sleep(injectedDeleteDelayMs)
     }
   }
 
